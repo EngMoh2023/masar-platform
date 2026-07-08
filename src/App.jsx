@@ -108,7 +108,16 @@ export default function App() {
     if (!prof) return;
     const col = prof.role === "company" ? "company_id" : "candidate_id";
     const { data, error } = await supabase.from("applications").select("*").eq(col, prof.id).order("applied_at", { ascending: false });
-    if (!error) setApps(data || []);
+    if (error) return;
+    let rows = data || [];
+    if (prof.role === "company" && rows.length > 0) {
+      const candidateIds = [...new Set(rows.map((r) => r.candidate_id))];
+      const { data: profs } = await supabase.from("profiles").select("*").in("id", candidateIds);
+      const byId = {};
+      (profs || []).forEach((p) => { byId[p.id] = p; });
+      rows = rows.map((r) => ({ ...r, candidateProfile: byId[r.candidate_id] || null }));
+    }
+    setApps(rows);
   }, []);
 
   const loadProfile = useCallback(async (userId) => {
@@ -248,7 +257,7 @@ export default function App() {
         <CompanyDashboard user={profile} jobs={jobs} apps={apps} refresh={persistJobsRefresh} onLogout={handleLogout} saving={saving} setSaving={setSaving} flash={flash} />
       )}
       {view === "dashboard" && profile && profile.role === "candidate" && (
-        <CandidateDashboard user={profile} jobs={jobs} apps={apps} refresh={persistJobsRefresh} onLogout={handleLogout} saving={saving} setSaving={setSaving} flash={flash} />
+        <CandidateDashboard user={profile} jobs={jobs} apps={apps} refresh={persistJobsRefresh} onLogout={handleLogout} saving={saving} setSaving={setSaving} flash={flash} onProfileUpdated={() => loadProfile(profile.id)} />
       )}
     </div>
   );
@@ -598,6 +607,24 @@ function ApplicantsPanel({ myJobs, apps, onUpdate }) {
                   <div>
                     <p style={{ fontWeight: 600 }}>{a.candidate_name}</p>
                     <p style={{ color: C.textMuted, fontSize: "0.82rem", marginTop: 2 }}>تقدّم في {fmtDate(a.applied_at)}</p>
+                    {a.candidateProfile?.specialization && (
+                      <p style={{ fontSize: "0.85rem", marginTop: 8 }}><strong>التخصص:</strong> {a.candidateProfile.specialization}</p>
+                    )}
+                    {a.candidateProfile?.desired_title && (
+                      <p style={{ fontSize: "0.85rem", marginTop: 2 }}><strong>يبحث عن:</strong> {a.candidateProfile.desired_title}</p>
+                    )}
+                    {a.candidateProfile?.experience_years != null && (
+                      <p style={{ fontSize: "0.85rem", marginTop: 2 }}><strong>سنوات الخبرة:</strong> {a.candidateProfile.experience_years}</p>
+                    )}
+                    {a.candidateProfile?.skills && (
+                      <p style={{ fontSize: "0.85rem", marginTop: 2, maxWidth: 460 }}><strong>المهارات:</strong> {a.candidateProfile.skills}</p>
+                    )}
+                    {a.candidateProfile?.resume_url && (
+                      <p style={{ fontSize: "0.85rem", marginTop: 2 }}>
+                        <strong>السيرة الذاتية:</strong>{" "}
+                        <a href={a.candidateProfile.resume_url} target="_blank" rel="noreferrer" style={{ color: C.brassDark }}>عرض الرابط</a>
+                      </p>
+                    )}
                     {a.note && <p style={{ fontSize: "0.85rem", marginTop: 6, maxWidth: 460 }}>{a.note}</p>}
                   </div>
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -617,7 +644,7 @@ function ApplicantsPanel({ myJobs, apps, onUpdate }) {
 }
 
 /* ============================== Candidate Dashboard ============================== */
-function CandidateDashboard({ user, jobs, apps, refresh, onLogout, saving, setSaving, flash }) {
+function CandidateDashboard({ user, jobs, apps, refresh, onLogout, saving, setSaving, flash, onProfileUpdated }) {
   const [tab, setTab] = useState("browse");
   const [query, setQuery] = useState("");
   const [locationFilter, setLocationFilter] = useState("");
@@ -656,9 +683,10 @@ function CandidateDashboard({ user, jobs, apps, refresh, onLogout, saving, setSa
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "30px 24px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 26, flexWrap: "wrap", gap: 12 }}>
           <h1 className="f-display" style={{ fontSize: "2rem" }}>أهلاً، {user.name}</h1>
-          <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <TabPill active={tab === "browse"} onClick={() => setTab("browse")} label="الوظائف المتاحة" count={openJobs.length} />
             <TabPill active={tab === "applications"} onClick={() => setTab("applications")} label="طلباتي" count={myApps.length} />
+            <TabPill active={tab === "profile"} onClick={() => setTab("profile")} label="الملف الشخصي" />
           </div>
         </div>
 
@@ -710,9 +738,109 @@ function CandidateDashboard({ user, jobs, apps, refresh, onLogout, saving, setSa
             </div>
           )
         )}
+        {tab === "profile" && (
+          <ProfileForm user={user} setSaving={setSaving} flash={flash} onSaved={onProfileUpdated} />
+        )}
       </div>
 
       {applyJob && <ApplyModal job={applyJob} onClose={() => setApplyJob(null)} onSubmit={(note) => submitApplication(applyJob, note)} />}
+    </div>
+  );
+}
+
+function ProfileForm({ user, setSaving, flash, onSaved }) {
+  const [f, setF] = useState({
+    desired_title: user.desired_title || "",
+    specialization: user.specialization || "",
+    skills: user.skills || "",
+    experience_years: user.experience_years ?? "",
+  });
+  const [uploading, setUploading] = useState(false);
+  const [fileName, setFileName] = useState(null);
+  const set = (k) => (e) => setF((s) => ({ ...s, [k]: e.target.value }));
+
+  const uploadResume = async (file) => {
+    if (!file) return;
+    if (file.type !== "application/pdf") {
+      flash("الملف لازم يكون PDF فقط", "err");
+      return;
+    }
+    setUploading(true);
+    const path = `${user.id}/${Date.now()}-${file.name}`;
+    const { error: upErr } = await supabase.storage.from("resumes").upload(path, file, { upsert: true });
+    if (upErr) {
+      setUploading(false);
+      flash(upErr.message, "err");
+      return;
+    }
+    const { data: pub } = supabase.storage.from("resumes").getPublicUrl(path);
+    const { error: dbErr } = await supabase.from("profiles").update({ resume_url: pub.publicUrl }).eq("id", user.id);
+    setUploading(false);
+    if (dbErr) {
+      flash(dbErr.message, "err");
+      return;
+    }
+    setFileName(file.name);
+    flash("تم رفع السيرة الذاتية بنجاح");
+    if (onSaved) onSaved();
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    const { error } = await supabase.from("profiles").update({
+      desired_title: f.desired_title || null,
+      specialization: f.specialization || null,
+      skills: f.skills || null,
+      experience_years: f.experience_years === "" ? null : Number(f.experience_years),
+    }).eq("id", user.id);
+    setSaving(false);
+    if (error) {
+      flash(error.message, "err");
+      return;
+    }
+    flash("تم حفظ ملفك الشخصي");
+    if (onSaved) onSaved();
+  };
+
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.line}`, borderRadius: 14, padding: 28, maxWidth: 560 }}>
+      <h2 className="f-display" style={{ fontSize: "1.6rem", marginBottom: 6 }}>ملفك الشخصي</h2>
+      <p style={{ color: C.textMuted, fontSize: "0.85rem", marginBottom: 20 }}>هذه المعلومات تظهر للشركات عند مراجعة طلبك.</p>
+
+      <div style={{ marginBottom: 22, paddingBottom: 20, borderBottom: `1px solid ${C.line}` }}>
+        <label style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: "0.85rem", color: C.textMuted }}>
+          السيرة الذاتية (PDF)
+          {user.resume_url && !fileName && (
+            <p style={{ fontSize: "0.82rem" }}>
+              الملف الحالي: <a href={user.resume_url} target="_blank" rel="noreferrer" style={{ color: C.brassDark }}>عرض السيرة الذاتية المرفوعة</a>
+            </p>
+          )}
+          {fileName && <p style={{ fontSize: "0.82rem", color: C.green }}>تم رفع: {fileName}</p>}
+          <input
+            type="file"
+            accept="application/pdf"
+            onChange={(e) => uploadResume(e.target.files?.[0])}
+            disabled={uploading}
+            style={{ border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 12px", background: "#fff", fontSize: "0.85rem" }}
+          />
+          {uploading && <span style={{ fontSize: "0.8rem", color: C.brassDark }}>جارٍ الرفع...</span>}
+        </label>
+      </div>
+
+      <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <Field label="التخصص" value={f.specialization} onChange={set("specialization")} />
+        <Field label="المسمّى الوظيفي المطلوب" value={f.desired_title} onChange={set("desired_title")} />
+        <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: "0.85rem", color: C.textMuted }}>
+          المهارات (افصل بينها بفاصلة)
+          <textarea value={f.skills} onChange={set("skills")} rows={3} placeholder="مثال: تصميم واجهات، React، إدارة مشاريع" style={{ border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 12px", resize: "vertical" }} />
+        </label>
+        <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: "0.85rem", color: C.textMuted }}>
+          سنوات الخبرة
+          <input type="number" min="0" value={f.experience_years} onChange={set("experience_years")} style={{ border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 12px", fontSize: "0.95rem", background: "#fff", color: C.textInk }} />
+        </label>
+        <button type="submit" style={{ ...btnBrass, justifyContent: "center", marginTop: 6 }}>حفظ الملف الشخصي</button>
+      </form>
     </div>
   );
 }
